@@ -1,0 +1,7 @@
+{
+    "dependencies": ["."],
+    "graphs": {
+        "agent": "./BasicGraph/HumanInLoop/BasicHITL_input.py:agent"
+    },
+    "env": ".env"
+}
