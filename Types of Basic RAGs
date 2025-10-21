@@ -1,0 +1,479 @@
+Classification RAG 
+
+
+from langchain_groq import ChatGroq
+from langchain_openai import OpenAIEmbeddings
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain_community.vectorstores import Chroma
+from langchain.embeddings import HuggingFaceEmbeddings
+from langchain_core.messages import AIMessage
+from langgraph.graph.message import add_messages
+from typing import TypedDict, Annotated
+from langchain_core.tools import tool
+from langgraph.graph import END
+from dotenv import load_dotenv
+from langchain_core.messages import HumanMessage
+from pprint import pprint
+from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.checkpoint.memory import MemorySaver
+from typing import TypedDict,Annotated
+from langgraph.types import interrupt, Command
+from langchain.schema import Document
+from langchain_core.output_parsers import StrOutputParser,PydanticOutputParser
+from langchain.prompts import ChatPromptTemplate,PromptTemplate
+from langgraph.graph import StateGraph
+from typing import Literal,Optional
+from pydantic import BaseModel,Field
+import os
+
+
+memory=MemorySaver()
+
+load_dotenv()
+
+# Setup Models
+model = ChatGroq(model="llama-3.1-8b-instant", temperature=0)
+
+embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001",
+                                           google_api_key="AIzaSyCJUpz87pteZWZfLJwrkMOmTxPcbWSNLOM")
+
+
+# Documents
+bits_documents = [
+    Document(page_content="Birla Institute of Technology and Science, Pilani (BITS Pilani) is one of India's premier private universities, established in 1964.", metadata={"category": "overview", "title": "College Overview"}),
+    Document(page_content="Current Director: Prof. V. Ramgopal Rao. Promoting research and collaborations.", metadata={"category": "administration", "title": "Director Information"}),
+    Document(page_content="BITS Pilani has 700+ teaching staff and 400+ non-teaching staff.", metadata={"category": "staff", "title": "Staff Count"}),
+    Document(page_content="Courses: B.E., B.Pharm, M.E., M.Pharm, MBA, Ph.D.", metadata={"category": "academics", "title": "Courses Offered"}),
+    Document(page_content="Top Recruiters: Google, Microsoft, Amazon, Tata Group.", metadata={"category": "placements", "title": "Top Companies Visited"}),
+    Document(page_content="Highest Package: ₹45 LPA, Avg: ₹15 LPA, 98% placement rate.", metadata={"category": "placements", "title": "Placement Statistics"}),
+    Document(page_content="Fee: ₹2.4L per semester + ₹70K hostel/mess. Scholarships available.", metadata={"category": "fees", "title": "Fee Structure"}),
+    Document(page_content="Address: BITS Pilani, Rajasthan - 333031, India. Phone: +91-1596-515294.", metadata={"category": "contact", "title": "Address and Contact"}),
+    Document(page_content="Website: https://www.bits-pilani.ac.in/", metadata={"category": "website", "title": "Official Website"})
+]
+
+# Vector Store
+vector_store = Chroma.from_documents(
+    documents=bits_documents,
+    embedding=embeddings,
+    persist_directory="BiT_DB",
+    collection_name="content"
+)
+
+# Retriever
+retriever = vector_store.as_retriever(search_type="mmr", search_kwargs={"k": 2, "lambda_mult": 0})
+
+# Query
+
+
+# Invoke
+
+
+class AgentState(TypedDict):
+    query: Annotated[list, add_messages]
+    response: str
+    relavence: str
+
+
+class RelevanceCheck(BaseModel):
+    relevance: Literal["YES", "NO"] = Field(description="Is it relevant to context or not?")
+
+
+builder = StateGraph(AgentState)
+
+
+def decider(state: AgentState):
+    latest_query = state["query"][-1].content
+
+    system_prompt = """
+You are an expert assistant for BITS Pilani University.
+
+Classify the user's query into one of these categories:
+overview, administration, staff, academics, placements, fees, contact, website
+
+If the query fits a category, return YES.
+If it doesn't fit exactly, return NO.
+
+Reply with only YES or NO.
+"""
+
+    prompt_template = ChatPromptTemplate.from_messages(
+        [
+            ("system", system_prompt),
+            ("human", "User query: {latest_query}")
+        ]
+    )
+
+    structured_chain = model.with_structured_output(RelevanceCheck)
+    chain = prompt_template | structured_chain
+
+    result = chain.invoke({"latest_query": latest_query})
+    print("Decider Output:", result)
+
+    state["relavence"] = result.relevance
+    return state
+
+
+DECIDER = "decider"
+RESPONSE = "response"
+ENDER = "ender"
+
+
+def conditional(state: AgentState):
+    if state["relavence"] == "YES":
+        return RESPONSE
+    else:
+        return ENDER
+
+
+def response(state: AgentState):
+    query = state["query"][-1].content
+    docs = retriever.invoke(query)
+
+    context = "\n".join([doc.page_content for doc in docs])
+
+    prompt = PromptTemplate(
+            template="""
+    You are a very useful AI Assistant who explains things crystal clear.
+    Answer the question ONLY from the provided context. If context is insufficient, say 'I don't respond anything.'
+
+    Context:
+    {context}
+
+    Question:
+    {question}
+    """,
+            input_variables=["context", "question"]
+        )
+
+    parser = StrOutputParser()
+    chain = prompt | model | parser
+    final_response = chain.invoke({"context": context, "question": query})
+
+    state["response"] = final_response
+    return state
+
+
+def ender(state: AgentState):
+    state["response"] = "I am sorry, I have insufficient context about this."
+    return state
+
+
+# Graph Structure
+builder.add_node(DECIDER, decider)
+builder.add_node(RESPONSE, response)
+builder.add_node(ENDER, ender)
+
+builder.set_entry_point(DECIDER)
+builder.add_conditional_edges(DECIDER, conditional)
+builder.add_edge(RESPONSE, END)
+builder.add_edge(ENDER, END)
+
+graph = builder.compile(checkpointer=memory)
+
+
+# Example State
+
+
+while True:
+    query = input("USER: ")
+    if query.lower() == 'exit':
+        break
+
+    state = {
+        "query": [
+            {"type": "human", "content": query}
+        ],
+        "response": "",
+        "relavence": ""
+    }
+
+    result = graph.invoke(state,
+                         {"configurable": {"thread_id": "user123"}})
+    print("AI :"+result["response"])
+
+
+
+
+
+
+
+
+
+
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                         RAG as a TOOL
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+from langchain_groq import ChatGroq
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain_community.vectorstores import Chroma
+from langchain_core.messages import HumanMessage, BaseMessage, AIMessage
+from langgraph.graph.message import add_messages
+from langchain_core.tools import tool
+from langgraph.graph import StateGraph, END
+from dotenv import load_dotenv
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.prebuilt import ToolNode
+from langchain.schema import Document
+from langchain.tools.retriever import create_retriever_tool
+from pydantic import BaseModel
+from typing import TypedDict, Annotated, Sequence, Literal, List, Dict
+import os
+
+# Load environment variables
+load_dotenv()
+
+# Initialize memory
+memory = MemorySaver()
+
+# Initialize LLM
+model = ChatGroq(model="llama-3.1-8b-instant", temperature=0)
+
+# Initialize embeddings
+embeddings = GoogleGenerativeAIEmbeddings(
+    model="models/embedding-001",
+    google_api_key="AIzaSyCJUpz87pteZWZfLJwrkMOmTxPcbWSNLOM" # best practice: avoid hardcoding
+)
+
+# BITS Pilani documents
+bits_documents = [
+    Document(page_content="Birla Institute of Technology and Science, Pilani (BITS Pilani) is one of India's premier private universities, established in 1964.", metadata={"category": "overview", "title": "College Overview"}),
+    Document(page_content="Current Director: Prof. V. Ramgopal Rao. Promoting research and collaborations.", metadata={"category": "administration", "title": "Director Information"}),
+    Document(page_content="BITS Pilani has 700+ teaching staff and 400+ non-teaching staff.", metadata={"category": "staff", "title": "Staff Count"}),
+    Document(page_content="Courses: B.E., B.Pharm, M.E., M.Pharm, MBA, Ph.D.", metadata={"category": "academics", "title": "Courses Offered"}),
+    Document(page_content="Top Recruiters: Google, Microsoft, Amazon, Tata Group.", metadata={"category": "placements", "title": "Top Companies Visited"}),
+    Document(page_content="Highest Package: ₹45 LPA, Avg: ₹15 LPA, 98% placement rate.", metadata={"category": "placements", "title": "Placement Statistics"}),
+    Document(page_content="Fee: ₹2.4L per semester + ₹70K hostel/mess. Scholarships available.", metadata={"category": "fees", "title": "Fee Structure"}),
+    Document(page_content="Address: BITS Pilani, Rajasthan - 333031, India. Phone: +91-1596-515294.", metadata={"category": "contact", "title": "Address and Contact"}),
+    Document(page_content="Website: https://www.bits-pilani.ac.in/", metadata={"category": "website", "title": "Official Website"})
+]
+
+# Vector store
+vector_store = Chroma.from_documents(
+    documents=bits_documents,
+    embedding=embeddings,
+    persist_directory="BiT",
+    collection_name="con"
+)
+
+# Retriever
+retriever = vector_store.as_retriever(search_type="mmr", search_kwargs={"k": 2, "lambda_mult": 0})
+
+# Tool: Retriever Tool
+retriever_tool = create_retriever_tool(
+    retriever=retriever,
+    name="retriver_tool",
+    description=(
+        "Information about BITS Pilani college, including categories: "
+        "overview, administration, staff, academics, placements, fees, contact, website."
+        "Use the most relevant documents based on the query category."
+    ))
+
+# Tool: Off-topic fallback
+class AgentState(TypedDict):
+    messages: Annotated[Sequence[BaseMessage], add_messages]
+    
+    
+@tool
+def offtopic(state:AgentState):
+    """Handles questions not related to BITS Pilani college."""
+    return {
+       "messages" :["I'm sorry, I can't answer that. My information is limited to BITS Pilani."]}
+
+
+
+
+# Define tools
+tools = [retriever_tool, offtopic]
+
+# Bind tools to model
+llm_with_tools = model.bind_tools(tools)
+
+# Agent state structure
+
+# Agent Node
+def llmnode(state: AgentState):
+    return {
+        "messages": [llm_with_tools.invoke(state["messages"])]
+    }
+
+# Branch logic
+def should_continue(state: AgentState) -> Literal["toolnode", END]:  # type: ignore
+    last_message = state["messages"][-1]
+    if last_message.tool_calls:
+        return "toolnode"
+    return END
+
+# Graph builder
+builder = StateGraph(AgentState)
+builder.add_node("agent", llmnode)
+builder.add_node("toolnode", ToolNode(tools)
+)
+
+
+builder.set_entry_point("agent")
+builder.add_conditional_edges("agent", should_continue)
+
+# Compile graph
+graph = builder.compile()
+
+# Run the graph
+query = {
+    "messages": [HumanMessage(content="iphone cost")]
+}
+
+# Stream output
+for event in graph.stream(query, stream_mode="values"):
+    event["messages"][-1].pretty_print()
+
+
+
+
+
+
+
+
+
+
+
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                         RAG as a SUB graph
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+
+
+
+from langchain_groq import ChatGroq
+from langchain_openai import OpenAIEmbeddings
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain_community.vectorstores import Chroma
+from langchain.embeddings import HuggingFaceEmbeddings
+from langchain_core.messages import AIMessage
+from langgraph.graph.message import add_messages
+from typing import TypedDict, Annotated
+from langchain_core.tools import tool
+from langgraph.graph import END,StateGraph
+from dotenv import load_dotenv
+from langchain_core.messages import HumanMessage
+from pprint import pprint
+from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.checkpoint.memory import MemorySaver
+from typing import TypedDict,Annotated
+from langgraph.types import interrupt, Command
+from langchain.schema import Document
+from langchain_core.output_parsers import StrOutputParser,PydanticOutputParser
+from langchain.prompts import ChatPromptTemplate,PromptTemplate
+from langgraph.graph import StateGraph
+from typing import Literal,Optional
+from pydantic import BaseModel,Field
+import os
+
+
+memory=MemorySaver()
+
+load_dotenv()
+
+# Setup Models
+model = ChatGroq(model="llama-3.1-8b-instant", temperature=0)
+
+@tool
+def add(a:int,b:int):
+    """this function is used to add  two numbers"""
+    return a+b
+
+
+
+tools=[add]
+
+
+AGENT="llmnode"
+TOOLS="tools"
+
+class AgentState(TypedDict):
+    messages:Annotated[list,add_messages]
+
+def lllm(state:AgentState):
+    llm_with_tools=model.bind_tools(tools)
+    return {
+        "messages":[llm_with_tools.invoke(state["messages"])]
+    }
+    
+    
+builder=StateGraph(AgentState)
+
+
+builder.add_node(AGENT,lllm)
+builder.add_node(TOOLS,ToolNode(tools))
+    
+builder.set_entry_point(AGENT)
+builder.add_conditional_edges(AGENT,tools_condition)
+builder.add_edge(TOOLS,AGENT)
+builder.add_edge(AGENT,END)
+
+intial={
+    "messages":["what is 2 + 3 ?"]
+}
+#! THIS IS SUBGRAPH WHICH HAS SOME FLOW
+child=builder.compile()
+
+
+
+
+
+#* CREATING ANOTHER GRAPH WITH SAME SCHEMA 
+parent=StateGraph(AgentState)
+
+#^ pass a graph as node to parent graph 
+parent.add_node("agents",child)
+
+    
+parent.set_entry_point("agents")
+parent.add_edge("agents",END)
+
+intial={
+    "messages":["what is 2 + 3 ?"]
+}
+
+graph2=parent.compile()
+
+
+val=graph2.invoke(intial)
+
+print(val["messages"][-1].content)
+
+
+
+
+#^ CREATING GRAPH WITH DIFFERENT SCHEMA
+
+
+
+
+class DifferentState(TypedDict):
+    query:str
+    response:Annotated[list,add_messages]
+    
+    
+Father=StateGraph(DifferentState)
+    
+def StateManagement(state:DifferentState):
+    message=state["query"]
+    response=child.invoke({"messages":message });
+    state["response"]=response["messages"][-1].content
+    return state
+
+
+
+Father.add_node("father",StateManagement)
+Father.set_entry_point("father")
+Father.add_edge("father",END)
+
+
+graph=Father.compile()
+result=graph.invoke({
+    "query":"what is 2 + 3?",
+    "response":[]
+    
+})
+
+print(result["response"][-1].content)
